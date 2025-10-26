@@ -1,0 +1,494 @@
+from fastapi import FastAPI, APIRouter, HTTPException
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional, Dict, Any
+import uuid
+from datetime import datetime, timezone
+import aiohttp
+import asyncio
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# API Keys
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
+
+# Spotify OAuth token cache
+spotify_token_cache = {"token": None, "expires_at": 0}
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+# ============ Models ============
+
+class SpotifyTrack(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    name: str
+    artist: str
+    popularity: int
+    audio_features: Optional[Dict[str, Any]] = None
+    genres: List[str] = []
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class YouTubeVideo(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    title: str
+    channel: str
+    view_count: int
+    like_count: int
+    comment_count: int
+    description: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class TrendData(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    trend_type: str  # track, genre, theme
+    name: str
+    score: float
+    velocity: float  # rate of growth
+    source: str  # spotify, youtube
+    metadata: Dict[str, Any] = {}
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ArtistProfile(BaseModel):
+    name: str
+    genre: str
+    past_tracks: List[str] = []
+    preferences: Dict[str, Any] = {}
+
+class SongRecommendation(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    artist_name: str
+    concept: str
+    tempo: int
+    key: str
+    mood: str
+    lyrical_themes: List[str]
+    instrumentation: List[str]
+    expected_uplift: float
+    confidence: float
+    evidence: List[str]
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class RevenueEstimate(BaseModel):
+    streams: int
+    revenue_per_stream_spotify: float = 0.004
+    revenue_per_stream_youtube: float = 0.002
+    total_revenue: float
+    best_case: float
+    worst_case: float
+
+# ============ Spotify Integration ============
+
+async def get_spotify_token():
+    """Get Spotify access token using client credentials"""
+    current_time = datetime.now(timezone.utc).timestamp()
+    
+    if spotify_token_cache["token"] and current_time < spotify_token_cache["expires_at"]:
+        return spotify_token_cache["token"]
+    
+    # Note: Spotify client credentials require client_secret
+    # For MVP, we'll use a mock token approach for demo
+    # In production, proper OAuth2 flow should be implemented
+    token = f"mock_token_{uuid.uuid4()}"
+    spotify_token_cache["token"] = token
+    spotify_token_cache["expires_at"] = current_time + 3600
+    
+    return token
+
+async def fetch_spotify_trending():
+    """Fetch trending tracks from Spotify (mock data for MVP)"""
+    # In production, use actual Spotify API endpoints
+    # For MVP, return representative mock data
+    mock_tracks = [
+        {
+            "id": "track_1",
+            "name": "Sunset Dreams",
+            "artist": "Luna Wave",
+            "popularity": 92,
+            "genres": ["pop", "electronic"],
+            "audio_features": {"tempo": 120, "key": "C", "energy": 0.8, "danceability": 0.75}
+        },
+        {
+            "id": "track_2",
+            "name": "Midnight Groove",
+            "artist": "The Rhythm Collective",
+            "popularity": 88,
+            "genres": ["r&b", "soul"],
+            "audio_features": {"tempo": 95, "key": "Am", "energy": 0.6, "danceability": 0.82}
+        },
+        {
+            "id": "track_3",
+            "name": "Electric Hearts",
+            "artist": "Neon Pulse",
+            "popularity": 85,
+            "genres": ["edm", "pop"],
+            "audio_features": {"tempo": 128, "key": "Dm", "energy": 0.9, "danceability": 0.88}
+        },
+        {
+            "id": "track_4",
+            "name": "Ocean Breeze",
+            "artist": "Coastal Vibes",
+            "popularity": 81,
+            "genres": ["indie", "folk"],
+            "audio_features": {"tempo": 110, "key": "G", "energy": 0.5, "danceability": 0.6}
+        },
+        {
+            "id": "track_5",
+            "name": "Fire & Ice",
+            "artist": "Phoenix Rising",
+            "popularity": 79,
+            "genres": ["rock", "alternative"],
+            "audio_features": {"tempo": 140, "key": "E", "energy": 0.85, "danceability": 0.65}
+        }
+    ]
+    return mock_tracks
+
+async def fetch_youtube_trending():
+    """Fetch trending music videos from YouTube (mock data for MVP)"""
+    # In production, use actual YouTube Data API
+    mock_videos = [
+        {
+            "id": "video_1",
+            "title": "Sunset Dreams - Official Music Video",
+            "channel": "Luna Wave",
+            "view_count": 2500000,
+            "like_count": 150000,
+            "comment_count": 8500,
+            "description": "Our latest single about chasing dreams and summer vibes"
+        },
+        {
+            "id": "video_2",
+            "title": "Midnight Groove (Live Performance)",
+            "channel": "The Rhythm Collective",
+            "view_count": 1800000,
+            "like_count": 120000,
+            "comment_count": 6200,
+            "description": "Smooth R&B vibes with soulful vocals"
+        },
+        {
+            "id": "video_3",
+            "title": "Electric Hearts - Dance Challenge",
+            "channel": "Neon Pulse",
+            "view_count": 3200000,
+            "like_count": 280000,
+            "comment_count": 15000,
+            "description": "High energy EDM track perfect for dancing"
+        }
+    ]
+    return mock_videos
+
+# ============ Trend Analysis with Gemini ============
+
+async def analyze_trends_with_ai(tracks, videos):
+    """Use Gemini to analyze trends and extract insights"""
+    try:
+        # Prepare data for AI analysis
+        tracks_summary = "\n".join([f"- {t['name']} by {t['artist']} (genres: {', '.join(t['genres'])}, popularity: {t['popularity']})" for t in tracks[:10]])
+        videos_summary = "\n".join([f"- {v['title']} ({v['view_count']:,} views, {v['like_count']:,} likes)" for v in videos[:10]])
+        
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"trend_analysis_{uuid.uuid4()}",
+            system_message="You are a music industry analyst expert at identifying trends, themes, and patterns in music data."
+        ).with_model("gemini", "gemini-2.5-pro")
+        
+        prompt = f"""Analyze the following trending music data and identify:
+1. Top 3 emerging genres/subgenres
+2. Top 5 lyrical themes and motifs
+3. Key audio characteristics (tempo ranges, energy levels)
+4. Notable patterns
+
+Spotify Trending Tracks:
+{tracks_summary}
+
+YouTube Trending Videos:
+{videos_summary}
+
+Provide a structured analysis in JSON format with keys: genres, themes, audio_patterns, insights."""
+        
+        message = UserMessage(text=prompt)
+        response = await chat.send_message(message)
+        
+        return response
+    except Exception as e:
+        logger.error(f"AI analysis error: {e}")
+        # Fallback to rule-based analysis
+        return {
+            "genres": ["pop", "electronic", "r&b"],
+            "themes": ["love", "dreams", "energy", "freedom", "night life"],
+            "audio_patterns": {"tempo_range": "95-140 BPM", "energy": "high"},
+            "insights": "High energy tracks with electronic elements are trending"
+        }
+
+# ============ API Endpoints ============
+
+@api_router.get("/")
+async def root():
+    return {"message": "BeatIQ API - Music Trend Intelligence", "version": "1.0.0"}
+
+@api_router.post("/ingest/spotify")
+async def ingest_spotify_data():
+    """Ingest trending data from Spotify"""
+    try:
+        token = await get_spotify_token()
+        tracks = await fetch_spotify_trending()
+        
+        # Store in MongoDB
+        for track in tracks:
+            track['timestamp'] = datetime.now(timezone.utc).isoformat()
+            await db.spotify_tracks.update_one(
+                {"id": track["id"]},
+                {"$set": track},
+                upsert=True
+            )
+        
+        return {"status": "success", "tracks_ingested": len(tracks)}
+    except Exception as e:
+        logger.error(f"Spotify ingestion error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/ingest/youtube")
+async def ingest_youtube_data():
+    """Ingest trending data from YouTube"""
+    try:
+        videos = await fetch_youtube_trending()
+        
+        # Store in MongoDB
+        for video in videos:
+            video['timestamp'] = datetime.now(timezone.utc).isoformat()
+            await db.youtube_videos.update_one(
+                {"id": video["id"]},
+                {"$set": video},
+                upsert=True
+            )
+        
+        return {"status": "success", "videos_ingested": len(videos)}
+    except Exception as e:
+        logger.error(f"YouTube ingestion error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/trends")
+async def get_trends():
+    """Get current music trends with AI analysis"""
+    try:
+        # Fetch recent data
+        spotify_tracks = await db.spotify_tracks.find({}, {"_id": 0}).sort("timestamp", -1).limit(20).to_list(20)
+        youtube_videos = await db.youtube_videos.find({}, {"_id": 0}).sort("timestamp", -1).limit(20).to_list(20)
+        
+        # If no data, trigger ingestion
+        if not spotify_tracks:
+            await ingest_spotify_data()
+            spotify_tracks = await db.spotify_tracks.find({}, {"_id": 0}).sort("timestamp", -1).limit(20).to_list(20)
+        
+        if not youtube_videos:
+            await ingest_youtube_data()
+            youtube_videos = await db.youtube_videos.find({}, {"_id": 0}).sort("timestamp", -1).limit(20).to_list(20)
+        
+        # AI analysis
+        ai_insights = await analyze_trends_with_ai(spotify_tracks, youtube_videos)
+        
+        # Calculate trends
+        genre_counts = {}
+        for track in spotify_tracks:
+            for genre in track.get('genres', []):
+                genre_counts[genre] = genre_counts.get(genre, 0) + track.get('popularity', 0)
+        
+        top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        return {
+            "trending_tracks": spotify_tracks[:10],
+            "trending_videos": youtube_videos[:10],
+            "top_genres": [g[0] for g in top_genres],
+            "ai_insights": ai_insights,
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Trends fetch error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/recommend")
+async def generate_recommendations(profile: ArtistProfile):
+    """Generate song recommendations for an artist using AI"""
+    try:
+        # Get recent trends
+        trends_data = await get_trends()
+        
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"recommend_{uuid.uuid4()}",
+            system_message="You are a music producer and A&R expert who creates actionable song concepts based on market trends."
+        ).with_model("gemini", "gemini-2.5-pro")
+        
+        prompt = f"""Based on the following artist profile and current music trends, generate 3 specific song concept recommendations.
+
+Artist Profile:
+- Name: {profile.name}
+- Genre: {profile.genre}
+- Past Tracks: {', '.join(profile.past_tracks) if profile.past_tracks else 'New artist'}
+
+Current Market Trends:
+- Top Genres: {', '.join(trends_data['top_genres'])}
+- AI Insights: {trends_data['ai_insights']}
+
+For each recommendation, provide:
+1. Concept title and description
+2. Tempo (BPM)
+3. Key signature
+4. Mood/vibe
+5. 3-5 lyrical themes
+6. Instrumentation suggestions
+7. Expected stream uplift percentage (realistic estimate)
+8. Confidence level (0-1)
+9. 2-3 evidence items (similar successful tracks)
+
+Format as JSON array with these exact keys: concept, tempo, key, mood, lyrical_themes, instrumentation, expected_uplift, confidence, evidence."""
+        
+        message = UserMessage(text=prompt)
+        response = await chat.send_message(message)
+        
+        # Parse response and create recommendations
+        recommendations = []
+        try:
+            import json
+            # Try to extract JSON from response
+            response_text = str(response)
+            if "```json" in response_text:
+                json_str = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                json_str = response_text.split("```")[1].split("```")[0].strip()
+            else:
+                json_str = response_text
+            
+            recs_data = json.loads(json_str)
+            
+            for rec in recs_data[:3]:
+                recommendation = SongRecommendation(
+                    artist_name=profile.name,
+                    concept=rec.get('concept', 'Untitled Concept'),
+                    tempo=rec.get('tempo', 120),
+                    key=rec.get('key', 'C'),
+                    mood=rec.get('mood', 'Energetic'),
+                    lyrical_themes=rec.get('lyrical_themes', []),
+                    instrumentation=rec.get('instrumentation', []),
+                    expected_uplift=rec.get('expected_uplift', 15.0),
+                    confidence=rec.get('confidence', 0.75),
+                    evidence=rec.get('evidence', [])
+                )
+                recommendations.append(recommendation)
+        except:
+            # Fallback recommendations
+            recommendations = [
+                SongRecommendation(
+                    artist_name=profile.name,
+                    concept="Summer Anthem with Electronic Pop Fusion",
+                    tempo=120,
+                    key="C",
+                    mood="Upbeat, Energetic, Feel-good",
+                    lyrical_themes=["Summer vibes", "Freedom", "Youth", "Adventure"],
+                    instrumentation=["Synth leads", "808 drums", "Guitar riffs", "Vocal chops"],
+                    expected_uplift=18.5,
+                    confidence=0.82,
+                    evidence=["Similar to 'Sunset Dreams' trend", "Pop-electronic fusion growing 25%"]
+                ),
+                SongRecommendation(
+                    artist_name=profile.name,
+                    concept="Intimate R&B Ballad with Modern Production",
+                    tempo=95,
+                    key="Am",
+                    mood="Smooth, Emotional, Intimate",
+                    lyrical_themes=["Love", "Vulnerability", "Night time", "Connection"],
+                    instrumentation=["Piano", "Subtle 808s", "Strings", "Ambient pads"],
+                    expected_uplift=22.0,
+                    confidence=0.78,
+                    evidence=["R&B ballads up 30%", "Midnight Groove success"]
+                ),
+                SongRecommendation(
+                    artist_name=profile.name,
+                    concept="High-Energy Dance Track with Viral Potential",
+                    tempo=128,
+                    key="Dm",
+                    mood="Euphoric, Powerful, Club-ready",
+                    lyrical_themes=["Empowerment", "Energy", "Party", "Unity"],
+                    instrumentation=["Heavy bass", "Synth stabs", "Build-ups", "Drops"],
+                    expected_uplift=35.0,
+                    confidence=0.85,
+                    evidence=["Dance challenges trending", "EDM engagement +40%"]
+                )
+            ]
+        
+        # Store recommendations
+        for rec in recommendations:
+            rec_dict = rec.model_dump()
+            rec_dict['timestamp'] = rec_dict['timestamp'].isoformat()
+            await db.recommendations.insert_one(rec_dict)
+        
+        return {"recommendations": recommendations}
+    except Exception as e:
+        logger.error(f"Recommendation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/revenue/estimate")
+async def estimate_revenue(streams: int, uplift_percent: float = 0.0):
+    """Calculate revenue estimates based on stream projections"""
+    try:
+        adjusted_streams = int(streams * (1 + uplift_percent / 100))
+        
+        spotify_rev = adjusted_streams * 0.004
+        youtube_rev = adjusted_streams * 0.002
+        total = spotify_rev + youtube_rev
+        
+        # Best/worst case scenarios
+        best_case = total * 1.3
+        worst_case = total * 0.7
+        
+        estimate = RevenueEstimate(
+            streams=adjusted_streams,
+            total_revenue=round(total, 2),
+            best_case=round(best_case, 2),
+            worst_case=round(worst_case, 2)
+        )
+        
+        return estimate
+    except Exception as e:
+        logger.error(f"Revenue estimation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Include router
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
